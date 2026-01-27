@@ -63,6 +63,7 @@
  *
  * VERSION HISTORY:
  * ----------------
+ * V1.6 - Added DS1307 I2C slave emulation
  * V1.5 - Fixed weekday conversion and timing bugs
  * V1.4 - WiFiManager integration for easy configuration
  * V1.3 - Added WiFi reconnection logic
@@ -89,6 +90,7 @@
 #include <WiFiManager.h>
 #include <Ticker.h>
 #include <TimeLib.h>
+#include "ds1307_emulation.h"
 
 // =============================================================================
 // FUNCTION PROTOTYPES
@@ -107,7 +109,7 @@ bool testWifi(void);
 // CONFIGURATION CONSTANTS
 // =============================================================================
 
-const char *FIRMWARE_VERSION = "V 1.5 - Fixed weekday and timing bugs";
+const char *FIRMWARE_VERSION = "V 1.6 - Added DS1307 I2C emulation";
 
 /**
  * DCF77 Signal Polarity Configuration
@@ -246,6 +248,10 @@ void setup()
   pinMode(LED_BUILTIN, OUTPUT);
   Serial.println();
   Serial.println("Startup complete");
+
+  // Initialize DS1307 I2C emulation
+  DS1307_init();
+  Serial.println("DS1307 I2C emulation active at address 0x68");
 }
 
 // =============================================================================
@@ -368,6 +374,8 @@ void ReadAndDecodeTime()
   Serial.println(udp.localPort());
   Serial.print("TimeServerIP: ");
   Serial.println(timeServerIP);
+  Serial.print("Uptime (s): ");
+  Serial.println(millis() / 1000);
 
   // Send NTP request and wait for response
   sendNTPpacket(timeServerIP);
@@ -500,6 +508,10 @@ void ReadAndDecodeTime()
     Serial.print(ThisMinute);
     Serial.print(':');
     Serial.println(ThisSecond);
+
+    // Sync DS1307 registers with NTP time
+    DS1307_syncFromNTP(ThisHour, ThisMinute, ThisSecond,
+                       DayOfW, ThisDay, ThisMonth, ThisYear);
 
     // If we're too close to minute boundary, skip this cycle
     // (not enough time to calculate and start transmission)

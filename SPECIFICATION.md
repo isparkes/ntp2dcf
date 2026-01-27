@@ -4,7 +4,7 @@
 
 | Field | Value |
 |-------|-------|
-| Version | 1.5 |
+| Version | 1.6 |
 | Date | January 2025 |
 | Status | Release |
 
@@ -22,6 +22,7 @@ NTP2DCF is a DCF77 radio time signal emulator that runs on an ESP8266 microcontr
 - Indoor use where the 77.5 kHz longwave signal cannot penetrate
 - Testing and development of DCF77 receiver circuits
 - Providing time synchronization without internet-connected clocks
+- Providing NTP-synchronized time to external microcontrollers via I2C (DS1307 emulation)
 
 ### 1.3 Background
 
@@ -43,7 +44,11 @@ DCF77 is a German longwave time signal broadcast from Mainflingen, Germany. Many
 | Function | Pin (D1 Mini) | Pin (ESP-01S) | Description |
 |----------|---------------|---------------|-------------|
 | DCF77 Output | D4 / GPIO2 | GPIO2 | Time signal output |
+| I2C SDA | D2 / GPIO4 | N/A | DS1307 emulation data |
+| I2C SCL | D1 / GPIO5 | N/A | DS1307 emulation clock |
 | Available | D3 / GPIO0 | GPIO0 | Reserved for future use |
+
+Note: I2C DS1307 emulation is only available on D1 Mini due to pin availability.
 
 ### 2.3 Signal Output Modes
 
@@ -80,6 +85,7 @@ TX    -->  RX
 | TimeLib | 1.6+ | Time calculations and conversions |
 | Ticker | Built-in | 100ms timer interrupt for signal generation |
 | WiFiUdp | Built-in | NTP packet communication |
+| Wire | Built-in | I2C communication for DS1307 emulation |
 
 ### 3.2 Build Configuration
 
@@ -105,19 +111,20 @@ monitor_speed = 115200
 |  - NTP query       |
 |  - DST calculation |
 |  - Array building  |
+|  - DS1307 sync     |
 +--------+----------+
          |
          v
-+--------+----------+
-|  CalculateArray    |
-|  - DCF77 encoding  |
-|  - Parity bits     |
-+--------+----------+
-         |
-         v
-+--------+----------+
-|  DcfOut (100ms)    |
-|  - Ticker ISR      |
++--------+----------+     +-------------------+
+|  CalculateArray    |     |  DS1307 Emulation |
+|  - DCF77 encoding  |     |  - I2C slave      |
+|  - Parity bits     |     |  - Register map   |
++--------+----------+     |  - Live time      |
+         |                 +-------------------+
+         v                         ^
++--------+----------+              |
+|  DcfOut (100ms)    |     I2C requests from
+|  - Ticker ISR      |     external devices
 |  - Pulse output    |
 +-------------------+
 ```
@@ -133,7 +140,8 @@ monitor_speed = 115200
 3. Attach 100ms ticker interrupt for DCF77 output
 4. Initialize pulse array with frame markers
 5. Start WiFiManager for network configuration
-6. Enter main loop upon WiFi connection
+6. Initialize DS1307 I2C slave emulation at address 0x68
+7. Enter main loop upon WiFi connection
 
 ### 4.2 WiFi Configuration
 
@@ -334,46 +342,114 @@ Main Loop Timing (successful transmission):
 
 ---
 
-## 9. Serial Debug Output
+## 9. DS1307 I2C Emulation
+
+### 9.1 Overview
+
+The firmware emulates a DS1307 Real-Time Clock chip, allowing external microcontrollers (Arduino, Raspberry Pi, etc.) to read NTP-synchronized time via I2C. This enables devices without WiFi capability to receive accurate time.
+
+### 9.2 I2C Configuration
+
+| Parameter | Value |
+|-----------|-------|
+| I2C Address | 0x68 (same as real DS1307) |
+| SDA Pin | GPIO4 (D2 on D1 Mini) |
+| SCL Pin | GPIO5 (D1 on D1 Mini) |
+| Mode | Slave |
+
+### 9.3 Register Map
+
+| Address | Name | Format | Description |
+|---------|------|--------|-------------|
+| 0x00 | Seconds | BCD | Bits 0-6: seconds (0-59), Bit 7: CH (0=running) |
+| 0x01 | Minutes | BCD | Minutes (0-59) |
+| 0x02 | Hours | BCD | Bits 0-5: hours (0-23), Bit 6: 0 (24-hour mode) |
+| 0x03 | Day | 1-7 | Day of week (1=Sunday, 7=Saturday) |
+| 0x04 | Date | BCD | Day of month (1-31) |
+| 0x05 | Month | BCD | Month (1-12) |
+| 0x06 | Year | BCD | Year (00-99, representing 2000-2099) |
+| 0x07 | Control | - | Control register (unused) |
+| 0x08-0x3F | RAM | - | 56 bytes RAM (unused) |
+
+### 9.4 Usage with RTClib
+
+External devices can read time using standard DS1307 libraries:
+
+```cpp
+#include <RTClib.h>
+#include <Wire.h>
+
+RTC_DS1307 rtc;
+
+void setup() {
+    Wire.begin();
+    rtc.begin();  // Connects to NTP2DCF at address 0x68
+}
+
+void loop() {
+    DateTime now = rtc.now();
+    // now contains NTP-synchronized time
+}
+```
+
+### 9.5 Live Time Updates
+
+The emulator maintains accurate time between NTP syncs by:
+1. Storing base time values when NTP sync occurs
+2. Tracking elapsed milliseconds since last sync
+3. Calculating current time on each I2C read request
+
+This ensures sub-second accuracy for time queries.
+
+### 9.6 Limitations
+
+- Write operations to time registers are accepted but ignored (time comes from NTP)
+- RAM registers (0x08-0x3F) are functional for read/write
+- Only 24-hour mode is supported
+- Date rollover between NTP syncs is not handled (acceptable for 60-second sync interval)
+
+---
+
+## 10. Serial Debug Output
 
 Baud rate: 115200
 
 ```
-INIT DCF77 emulator V 1.5 - Fixed weekday and timing bugs
+INIT DCF77 emulator V 1.6
 
 Starting WiFi-Manager
 
 WiFi connected
 
-
-Startup
+Startup complete
+DS1307 I2C emulation active at address 0x68
 Starting UDP
 Local port: 2390
 TimeServerIP: 192.53.103.108
-sending NTP packet...
-packet received, length=48
-Seconds since 1. 1. 1900 = 3944123456
+Sending NTP packet...
+NTP packet received, length=48
+Seconds since 1900 = 3944123456
 Unix time = 1735134656
-Local time is: 25. 12. 2024 Dls:0 14:30:56
+Local date: 25.12.2024 DST=0 14:30:56
 ```
 
 ---
 
-## 10. Known Limitations
+## 11. Known Limitations
 
-### 10.1 Timing Accuracy
+### 11.1 Timing Accuracy
 
 - NTP network latency is not compensated
 - Sub-second accuracy is not guaranteed
 - Clock drift between NTP queries is not corrected
 
-### 10.2 DST Transition
+### 11.2 DST Transition
 
 - If transmission spans DST change time, all three minutes use the same DST state
 - Exact transition at 02:00/03:00 is not implemented
 - Clocks may show incorrect time until 03:03 on transition day
 
-### 10.3 Protocol Completeness
+### 11.3 Protocol Completeness
 
 The following DCF77 features are NOT implemented:
 - Weather information (bits 1-14)
@@ -382,7 +458,7 @@ The following DCF77 features are NOT implemented:
 - Leap second announcement (bit 19)
 - Phase modulation (pseudo-random sequence)
 
-### 10.4 Hardware Limitations
+### 11.4 Hardware Limitations
 
 - Output is baseband digital signal only
 - No 77.5 kHz carrier modulation
@@ -391,11 +467,11 @@ The following DCF77 features are NOT implemented:
 
 ---
 
-## 11. Testing
+## 12. Testing
 
-### 11.1 Unit Tests
+### 12.1 Unit Tests
 
-Located in `test/test_dcf77/test_main.cpp`:
+#### DCF77 Tests (`test/test_dcf77/test_main.cpp`)
 
 | Test Category | Count | Coverage |
 |---------------|-------|----------|
@@ -406,7 +482,19 @@ Located in `test/test_dcf77/test_main.cpp`:
 | Edge cases | 4 | Midnight, 23:59, leap year |
 | **Total** | **27** | |
 
-### 11.2 Running Tests
+#### DS1307 Emulation Tests (`test/test_ds1307/test_ds1307.cpp`)
+
+| Test Category | Count | Coverage |
+|---------------|-------|----------|
+| BCD conversion (toBCD) | 8 | All time fields |
+| BCD conversion (fromBCD) | 3 | Inverse conversion + roundtrip |
+| Register format | 3 | Seconds, hours, day-of-week |
+| Boundary values | 4 | Midnight, end-of-day, year boundaries |
+| Address pointer | 2 | Wraparound, sequential increment |
+| Register constants | 3 | Addresses, I2C address, count |
+| **Total** | **23** | |
+
+### 12.2 Running Tests
 
 ```bash
 pio test -e native
@@ -414,7 +502,7 @@ pio test -e native
 
 ---
 
-## 12. Version History
+## 13. Version History
 
 | Version | Date | Changes |
 |---------|------|---------|
@@ -424,13 +512,16 @@ pio test -e native
 | 1.3 | Dec 2022 | CLT2 adaptation |
 | 1.4 | Dec 2022 | Minor fixes |
 | 1.5 | Jan 2025 | Fixed weekday encoding bug, fixed timing calculation bug, removed unused code, added unit tests |
+| 1.6 | Jan 2025 | Added DS1307 I2C slave emulation for external time access |
 
 ---
 
-## 13. References
+## 14. References
 
 1. [DCF77 Wikipedia](https://en.wikipedia.org/wiki/DCF77)
 2. [PTB DCF77 Official](https://www.ptb.de/cms/en/ptb/fachabteilungen/abt4/fb-44/ag-442/dissemination-of-legal-time/dcf77.html)
 3. [Elektor DCF77 Emulator Project](https://www.elektormagazine.com/labs/dcf77-emulator-with-esp8266-elektor-labs-version-150713)
 4. [NTP Protocol (RFC 5905)](https://tools.ietf.org/html/rfc5905)
 5. [ESP8266 Arduino Core](https://arduino-esp8266.readthedocs.io/)
+6. [DS1307 Datasheet](https://www.analog.com/media/en/technical-documentation/data-sheets/ds1307.pdf)
+7. [RTClib Arduino Library](https://github.com/adafruit/RTClib)
