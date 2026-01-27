@@ -63,6 +63,7 @@
  *
  * VERSION HISTORY:
  * ----------------
+ * V1.7 - Added web-based configuration interface
  * V1.6 - Added DS1307 I2C slave emulation
  * V1.5 - Fixed weekday conversion and timing bugs
  * V1.4 - WiFiManager integration for easy configuration
@@ -90,7 +91,10 @@
 #include <WiFiManager.h>
 #include <Ticker.h>
 #include <TimeLib.h>
+#include <time.h>
 #include "ds1307_emulation.h"
+#include "config_storage.h"
+#include "web_server.h"
 
 // =============================================================================
 // FUNCTION PROTOTYPES
@@ -109,7 +113,7 @@ bool testWifi(void);
 // CONFIGURATION CONSTANTS
 // =============================================================================
 
-const char *FIRMWARE_VERSION = "V 1.6 - Added DS1307 I2C emulation";
+const char *FIRMWARE_VERSION = "V 1.7 - Web configuration interface";
 
 /**
  * DCF77 Signal Polarity Configuration
@@ -134,17 +138,17 @@ const char *FIRMWARE_VERSION = "V 1.6 - Added DS1307 I2C emulation";
 
 unsigned int localPort = 2390;                     // Local UDP port for NTP
 IPAddress timeServerIP;                            // NTP server IP (resolved at runtime)
-const char *ntpServerName = "0.de.pool.ntp.org";   // NTP pool server (Germany)
 const int NTP_PACKET_SIZE = 48;                    // Standard NTP packet size
 byte packetBuffer[NTP_PACKET_SIZE];                // NTP packet buffer
 WiFiUDP udp;                                       // UDP instance for NTP communication
 int UdpNoReplyCounter = 0;                         // Counter for failed NTP requests
 
 // =============================================================================
-// TIMEZONE CONFIGURATION
+// TIMING AND STATUS TRACKING
 // =============================================================================
 
-const int timeZone = 1;  // CET = UTC+1 (base timezone, DST adds +1 more)
+unsigned long lastNtpSyncMillis = 0;               // Timestamp of last successful NTP sync
+unsigned long lastNtpCheckMillis = 0;              // Timestamp of last NTP check attempt
 
 // =============================================================================
 // DCF77 PROTOCOL CONSTANTS
@@ -214,6 +218,9 @@ void setup()
   Serial.println(FIRMWARE_VERSION);
   delay(1000);
 
+  // Load configuration from EEPROM (or use defaults)
+  loadConfig();
+
   // Configure DCF77 output pin
   pinMode(LedPin, OUTPUT);
   digitalWrite(LedPin, LOW);
@@ -246,6 +253,16 @@ void setup()
   Serial.println("WiFi connected");
   delay(10);
   pinMode(LED_BUILTIN, OUTPUT);
+
+  // Configure timezone using POSIX TZ string
+  // This enables automatic DST handling
+  configTime(config.tzPosix, config.ntpServer);
+  Serial.print("Timezone configured: ");
+  Serial.println(config.tzPosix);
+
+  // Start the web server for configuration
+  setupWebServer();
+
   Serial.println();
   Serial.println("Startup complete");
 
@@ -261,24 +278,37 @@ void setup()
 /**
  * loop()
  * ------
- * Main program loop, runs once per minute:
- * 1. Checks WiFi connection status
- * 2. If connected: fetches NTP time and starts DCF77 transmission
- * 3. If disconnected: attempts to reconnect
- * 4. Waits 60 seconds before next cycle
+ * Main program loop (non-blocking):
+ * 1. Handles web server requests
+ * 2. Checks WiFi connection status
+ * 3. At configured intervals: fetches NTP time and starts DCF77 transmission
  *
  * Note: The actual DCF77 pulse generation runs independently via
- * the DcfOutTimer interrupt, allowing this loop to handle only
- * the higher-level NTP synchronization.
+ * the DcfOutTimer interrupt, allowing this loop to handle web requests
+ * and NTP synchronization without blocking.
  */
 void loop()
 {
-  if (WiFi.status() == WL_CONNECTED)
-    ReadAndDecodeTime();
-  else
-    ReConnectToWiFi();
+  // Handle web server requests (non-blocking)
+  webServer.handleClient();
 
-  delay(60000);  // Wait 1 minute between NTP syncs
+  if (WiFi.status() == WL_CONNECTED)
+  {
+    // Check if it's time for an NTP sync
+    unsigned long now = millis();
+    if (now - lastNtpCheckMillis >= (unsigned long)config.ntpInterval * 1000)
+    {
+      lastNtpCheckMillis = now;
+      ReadAndDecodeTime();
+    }
+  }
+  else
+  {
+    ReConnectToWiFi();
+  }
+
+  // Small delay to prevent tight loop and allow background tasks
+  delay(10);
 }
 
 // =============================================================================
@@ -363,10 +393,8 @@ void ReConnectToWiFi()
  */
 void ReadAndDecodeTime()
 {
-  int DayToEndOfMonth, DayOfWeekToEnd, DayOfWeekToSunday;
-
-  // Resolve NTP server hostname to IP address
-  WiFi.hostByName(ntpServerName, timeServerIP);
+  // Resolve NTP server hostname to IP address (from config)
+  WiFi.hostByName(config.ntpServer, timeServerIP);
 
   Serial.println("Starting UDP");
   udp.begin(localPort);
@@ -402,6 +430,7 @@ void ReadAndDecodeTime()
     // =========================================================================
 
     UdpNoReplyCounter = 0;
+    lastNtpSyncMillis = millis();  // Record successful sync time
     Serial.print("NTP packet received, length=");
     Serial.println(packetSize);
 
@@ -416,92 +445,51 @@ void ReadAndDecodeTime()
     Serial.print("Seconds since 1900 = ");
     Serial.println(secsSince1900);
 
-    // Convert NTP timestamp to Unix timestamp
+    // Convert NTP timestamp to Unix timestamp (UTC)
     // Unix epoch starts January 1, 1970 (70 years after NTP epoch)
     const unsigned long seventyYears = 2208988800UL;
+    time_t utcTime = secsSince1900 - seventyYears;
 
-    // Calculate local time with timezone offset
     // Add 120 seconds (2 minutes) because:
     //   - DCF77 transmits time for the NEXT minute (+60s)
     //   - Our transmission starts at the NEXT minute boundary (+60s more)
-    time_t ThisTime = secsSince1900 - seventyYears + (timeZone * 3600) + 120;
-    Serial.print("Unix time = ");
-    Serial.println(ThisTime);
+    utcTime += 120;
+
+    Serial.print("Unix time (UTC) = ");
+    Serial.println(utcTime);
 
     // =========================================================================
-    // DATE EXTRACTION (for DST calculation)
+    // TIMEZONE AND DST CONVERSION (using POSIX TZ string)
     // =========================================================================
+    // The configTime() function was called with the POSIX TZ string,
+    // so localtime_r() will automatically apply timezone and DST rules.
 
-    DayOfW = weekday(ThisTime);    // Day of week (Sun=1, Mon=2, ..., Sat=7)
-    ThisDay = day(ThisTime);       // Day of month (1-31)
-    ThisMonth = month(ThisTime);   // Month (1-12)
-    ThisYear = year(ThisTime);     // Year (e.g., 2024)
+    struct tm timeinfo;
+    localtime_r(&utcTime, &timeinfo);
 
-    Serial.print("Local date: ");
+    // Extract time components
+    ThisSecond = timeinfo.tm_sec;
+    ThisMinute = timeinfo.tm_min;
+    ThisHour = timeinfo.tm_hour;
+    ThisDay = timeinfo.tm_mday;
+    ThisMonth = timeinfo.tm_mon + 1;  // tm_mon is 0-11
+    ThisYear = timeinfo.tm_year + 1900;  // tm_year is years since 1900
+    DayOfW = timeinfo.tm_wday + 1;  // tm_wday is 0-6 (Sun=0), we need 1-7 (Sun=1)
+    if (DayOfW == 0) DayOfW = 7;  // Handle edge case
+
+    // DST flag from the system (automatically calculated from POSIX TZ string)
+    Dls = timeinfo.tm_isdst > 0 ? 1 : 0;
+
+    Serial.print("Local time: ");
     Serial.print(ThisDay);
     Serial.print(".");
     Serial.print(ThisMonth);
     Serial.print(".");
     Serial.print(ThisYear);
     Serial.print(" ");
-
-    // =========================================================================
-    // DAYLIGHT SAVING TIME (DST) CALCULATION
-    // =========================================================================
-    // European DST rules:
-    //   - Summer time (CEST): Last Sunday of March at 02:00 -> 03:00
-    //   - Winter time (CET):  Last Sunday of October at 03:00 -> 02:00
-    //
-    // Note: This simplified algorithm doesn't handle the exact hour of
-    // transition; it changes at midnight of the last Sunday.
-
-    Dls = 0;  // Default: winter time (CET)
-
-    // April through September: definitely summer time
-    if (ThisMonth > 3 && ThisMonth < 10)
-    {
-      Dls = 1;
-    }
-
-    // March: check if we've passed the last Sunday
-    if (ThisMonth == 3 && ThisDay > 24)
-    {
-      DayToEndOfMonth = 31 - ThisDay;
-      DayOfWeekToSunday = 7 - DayOfW;
-      // If next Sunday would be after month end, we've passed the last Sunday
-      if (DayOfWeekToSunday >= DayToEndOfMonth)
-        Dls = 1;
-    }
-
-    // October: summer time until last Sunday
-    if (ThisMonth == 10)
-    {
-      Dls = 1;  // Assume summer time
-      if (ThisDay > 24)
-      {
-        DayToEndOfMonth = 31 - ThisDay;
-        DayOfWeekToEnd = 7 - DayOfW;
-        // If next Sunday would be after month end, we've passed the last Sunday
-        if (DayOfWeekToEnd >= DayToEndOfMonth)
-          Dls = 0;  // Switch to winter time
-      }
-    }
-
     Serial.print("DST=");
     Serial.print(Dls);
     Serial.print(" ");
-
-    // Apply DST offset if in summer time
-    if (Dls == 1)
-      ThisTime += 3600;  // Add 1 hour for CEST
-
-    // =========================================================================
-    // TIME EXTRACTION (after DST adjustment)
-    // =========================================================================
-
-    ThisHour = hour(ThisTime);
-    ThisMinute = minute(ThisTime);
-    ThisSecond = second(ThisTime);
 
     Serial.print(ThisHour);
     Serial.print(':');
@@ -534,23 +522,31 @@ void ReadAndDecodeTime()
     CalculateArray(FirstMinutePulseBegin);
 
     // Second minute (+1)
-    ThisTime += 60;
-    DayOfW = weekday(ThisTime);
-    ThisDay = day(ThisTime);
-    ThisMonth = month(ThisTime);
-    ThisYear = year(ThisTime);
-    ThisHour = hour(ThisTime);
-    ThisMinute = minute(ThisTime);
+    utcTime += 60;
+    localtime_r(&utcTime, &timeinfo);
+    ThisSecond = timeinfo.tm_sec;
+    ThisMinute = timeinfo.tm_min;
+    ThisHour = timeinfo.tm_hour;
+    ThisDay = timeinfo.tm_mday;
+    ThisMonth = timeinfo.tm_mon + 1;
+    ThisYear = timeinfo.tm_year + 1900;
+    DayOfW = timeinfo.tm_wday + 1;
+    if (DayOfW == 0) DayOfW = 7;
+    Dls = timeinfo.tm_isdst > 0 ? 1 : 0;
     CalculateArray(SecondMinutePulseBegin);
 
     // Third minute (+2)
-    ThisTime += 60;
-    DayOfW = weekday(ThisTime);
-    ThisDay = day(ThisTime);
-    ThisMonth = month(ThisTime);
-    ThisYear = year(ThisTime);
-    ThisHour = hour(ThisTime);
-    ThisMinute = minute(ThisTime);
+    utcTime += 60;
+    localtime_r(&utcTime, &timeinfo);
+    ThisSecond = timeinfo.tm_sec;
+    ThisMinute = timeinfo.tm_min;
+    ThisHour = timeinfo.tm_hour;
+    ThisDay = timeinfo.tm_mday;
+    ThisMonth = timeinfo.tm_mon + 1;
+    ThisYear = timeinfo.tm_year + 1900;
+    DayOfW = timeinfo.tm_wday + 1;
+    if (DayOfW == 0) DayOfW = 7;
+    Dls = timeinfo.tm_isdst > 0 ? 1 : 0;
     CalculateArray(ThirdMinutePulseBegin);
 
     // =========================================================================

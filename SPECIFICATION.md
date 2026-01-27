@@ -4,7 +4,7 @@
 
 | Field | Value |
 |-------|-------|
-| Version | 1.6 |
+| Version | 1.7 |
 | Date | January 2025 |
 | Status | Release |
 
@@ -86,6 +86,8 @@ TX    -->  RX
 | Ticker | Built-in | 100ms timer interrupt for signal generation |
 | WiFiUdp | Built-in | NTP packet communication |
 | Wire | Built-in | I2C communication for DS1307 emulation |
+| ESP8266WebServer | Built-in | Web configuration interface |
+| EEPROM | Built-in | Persistent configuration storage |
 
 ### 3.2 Build Configuration
 
@@ -410,16 +412,90 @@ This ensures sub-second accuracy for time queries.
 
 ---
 
-## 10. Serial Debug Output
+## 10. Web Configuration Interface
+
+### 10.1 Overview
+
+The firmware includes a built-in web server that provides runtime configuration without recompilation. Access the interface by navigating to the device's IP address in a web browser.
+
+### 10.2 Web Server Configuration
+
+| Parameter | Value |
+|-----------|-------|
+| Port | 80 (HTTP) |
+| URL | `http://<device-ip>/` |
+
+### 10.3 Configuration Options
+
+| Setting | Description | Default | Range |
+|---------|-------------|---------|-------|
+| NTP Server | NTP pool hostname | `0.de.pool.ntp.org` | Any valid hostname |
+| Timezone | POSIX TZ string | `CET-1CEST,M3.5.0,M10.5.0/3` | Valid POSIX TZ |
+| NTP Interval | Sync frequency | 60 seconds | 60-3600 seconds |
+
+### 10.4 POSIX Timezone String Format
+
+The timezone is configured using POSIX TZ strings, which automatically handle DST transitions.
+
+**Format:** `STD offset [DST[offset],start[/time],end[/time]]`
+
+**Common Examples:**
+
+| Region | POSIX TZ String |
+|--------|-----------------|
+| Central Europe (CET/CEST) | `CET-1CEST,M3.5.0,M10.5.0/3` |
+| UK (GMT/BST) | `GMT0BST,M3.5.0/1,M10.5.0` |
+| US Eastern (EST/EDT) | `EST5EDT,M3.2.0,M11.1.0` |
+| US Pacific (PST/PDT) | `PST8PDT,M3.2.0,M11.1.0` |
+| Japan (JST, no DST) | `JST-9` |
+| Australia Eastern | `AEST-10AEDT,M10.1.0,M4.1.0/3` |
+
+### 10.5 Status Display
+
+The web interface displays real-time status information:
+
+| Status Item | Description |
+|-------------|-------------|
+| Uptime | Time since device boot |
+| WiFi Signal | RSSI in dBm |
+| Last NTP Sync | Time since last successful sync |
+| Current Time | Local time with timezone |
+| DCF77 Status | Transmitting or Idle |
+
+### 10.6 API Endpoints
+
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/` | GET | Main configuration page |
+| `/status` | GET | JSON status data |
+| `/config` | GET | JSON current configuration |
+| `/config` | POST | Save new configuration |
+
+### 10.7 Configuration Storage
+
+- Configuration is stored in EEPROM (256 bytes)
+- Changes persist across reboots
+- Invalid or corrupted config automatically resets to defaults
+
+---
+
+## 11. Serial Debug Output
 
 Baud rate: 115200
 
 ```
-INIT DCF77 emulator V 1.6
+INIT DCF77 emulator V 1.7
+
+Config: Loaded from EEPROM
+  NTP Server: 0.de.pool.ntp.org
+  Timezone: CET-1CEST,M3.5.0,M10.5.0/3
+  Sync Interval: 60s
 
 Starting WiFi-Manager
 
 WiFi connected
+Timezone configured: CET-1CEST,M3.5.0,M10.5.0/3
+Web server started at http://192.168.1.100
 
 Startup complete
 DS1307 I2C emulation active at address 0x68
@@ -429,27 +505,27 @@ TimeServerIP: 192.53.103.108
 Sending NTP packet...
 NTP packet received, length=48
 Seconds since 1900 = 3944123456
-Unix time = 1735134656
-Local date: 25.12.2024 DST=0 14:30:56
+Unix time (UTC) = 1735134656
+Local time: 25.12.2024 DST=0 14:30:56
 ```
 
 ---
 
-## 11. Known Limitations
+## 12. Known Limitations
 
-### 11.1 Timing Accuracy
+### 12.1 Timing Accuracy
 
 - NTP network latency is not compensated
 - Sub-second accuracy is not guaranteed
 - Clock drift between NTP queries is not corrected
 
-### 11.2 DST Transition
+### 12.2 DST Transition
 
 - If transmission spans DST change time, all three minutes use the same DST state
 - Exact transition at 02:00/03:00 is not implemented
 - Clocks may show incorrect time until 03:03 on transition day
 
-### 11.3 Protocol Completeness
+### 12.3 Protocol Completeness
 
 The following DCF77 features are NOT implemented:
 - Weather information (bits 1-14)
@@ -458,7 +534,7 @@ The following DCF77 features are NOT implemented:
 - Leap second announcement (bit 19)
 - Phase modulation (pseudo-random sequence)
 
-### 11.4 Hardware Limitations
+### 12.4 Hardware Limitations
 
 - Output is baseband digital signal only
 - No 77.5 kHz carrier modulation
@@ -467,9 +543,9 @@ The following DCF77 features are NOT implemented:
 
 ---
 
-## 12. Testing
+## 13. Testing
 
-### 12.1 Unit Tests
+### 13.1 Unit Tests
 
 #### DCF77 Tests (`test/test_dcf77/test_main.cpp`)
 
@@ -494,7 +570,7 @@ The following DCF77 features are NOT implemented:
 | Register constants | 3 | Addresses, I2C address, count |
 | **Total** | **23** | |
 
-### 12.2 Running Tests
+### 13.2 Running Tests
 
 ```bash
 pio test -e native
@@ -502,7 +578,7 @@ pio test -e native
 
 ---
 
-## 13. Version History
+## 14. Version History
 
 | Version | Date | Changes |
 |---------|------|---------|
@@ -513,10 +589,11 @@ pio test -e native
 | 1.4 | Dec 2022 | Minor fixes |
 | 1.5 | Jan 2025 | Fixed weekday encoding bug, fixed timing calculation bug, removed unused code, added unit tests |
 | 1.6 | Jan 2025 | Added DS1307 I2C slave emulation for external time access |
+| 1.7 | Jan 2025 | Added web configuration interface with POSIX timezone support |
 
 ---
 
-## 14. References
+## 15. References
 
 1. [DCF77 Wikipedia](https://en.wikipedia.org/wiki/DCF77)
 2. [PTB DCF77 Official](https://www.ptb.de/cms/en/ptb/fachabteilungen/abt4/fb-44/ag-442/dissemination-of-legal-time/dcf77.html)
