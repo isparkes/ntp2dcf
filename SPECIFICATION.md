@@ -570,6 +570,18 @@ The following DCF77 features are NOT implemented:
 | Register constants | 3 | Addresses, I2C address, count |
 | **Total** | **23** | |
 
+#### Configuration Storage Tests (`test/test_config/test_config.cpp`)
+
+| Test Category | Count | Coverage |
+|---------------|-------|----------|
+| Structure validation | 4 | Size, magic, version, field sizes |
+| Default values | 3 | NTP server, timezone, interval |
+| String lengths | 2 | TZ string, NTP server fit buffers |
+| Interval validation | 2 | Min/max range |
+| EEPROM constraints | 2 | Size, config fits |
+| Example validation | 2 | Common TZ strings, NTP servers |
+| **Total** | **15** | |
+
 ### 13.2 Running Tests
 
 ```bash
