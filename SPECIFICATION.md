@@ -4,8 +4,8 @@
 
 | Field | Value |
 |-------|-------|
-| Version | 1.7 |
-| Date | January 2025 |
+| Version | 1.8 |
+| Date | January 2026 |
 | Status | Release |
 
 ---
@@ -52,11 +52,11 @@ Note: I2C DS1307 emulation is only available on D1 Mini due to pin availability.
 
 ### 2.3 Signal Output Modes
 
-The output signal polarity is configurable at compile time:
+The output signal polarity is configurable via the web interface:
 
 | Mode | `pause` | `sig` | Compatible Modules |
 |------|---------|-------|-------------------|
-| Not Inverted (default) | 0 (LOW) | 1 (HIGH) | ELV modules |
+| Non-inverted (default) | 0 (LOW) | 1 (HIGH) | ELV modules |
 | Inverted | 1 (HIGH) | 0 (LOW) | Pollin modules |
 
 ### 2.4 Programming Interface (ESP-01S)
@@ -101,34 +101,44 @@ monitor_speed = 115200
 
 ### 3.3 Module Structure
 
+NTP synchronization and DCF77 transmission operate on independent timers:
+
 ```
-+-------------------+
-|    Main Loop      |
-|  (60s interval)   |
-+--------+----------+
-         |
-         v
-+--------+----------+
-|  ReadAndDecodeTime |
-|  - NTP query       |
-|  - DST calculation |
-|  - Array building  |
-|  - DS1307 sync     |
-+--------+----------+
-         |
-         v
-+--------+----------+     +-------------------+
-|  CalculateArray    |     |  DS1307 Emulation |
-|  - DCF77 encoding  |     |  - I2C slave      |
-|  - Parity bits     |     |  - Register map   |
-+--------+----------+     |  - Live time      |
-         |                 +-------------------+
-         v                         ^
-+--------+----------+              |
-|  DcfOut (100ms)    |     I2C requests from
-|  - Ticker ISR      |     external devices
-|  - Pulse output    |
-+-------------------+
++------------------------------------------------------+
+|                     Main Loop                         |
+|                                                      |
+|  +-- NTP Timer (config.ntpInterval, default 7201s) --+
+|  |                                                   |
+|  v                                                   |
+|  +------------------+                                |
+|  |  syncNTP()       |     +-------------------+      |
+|  |  - NTP query     |     |  DS1307 Emulation |      |
+|  |  - DS1307 sync   |     |  - I2C slave      |      |
+|  +------------------+     |  - Register map   |      |
+|                           |  - Live time      |      |
+|  +-- DCF Timer (300s) ---+-------------------+      |
+|  |                                ^                  |
+|  v                                |                  |
+|  +------------------------+  I2C requests from       |
+|  | startDcfTransmission() |  external devices        |
+|  | - Read system clock    |                          |
+|  | - Array building       |                          |
+|  +--------+---------------+                          |
+|           |                                          |
+|           v                                          |
+|  +--------+----------+                               |
+|  |  CalculateArray    |                               |
+|  |  - DCF77 encoding  |                               |
+|  |  - Parity bits     |                               |
+|  +--------+----------+                               |
+|           |                                          |
+|           v                                          |
+|  +--------+----------+                               |
+|  |  DcfOut (100ms)    |                               |
+|  |  - Ticker ISR      |                               |
+|  |  - Pulse output    |                               |
+|  +-------------------+                               |
++------------------------------------------------------+
 ```
 
 ---
@@ -138,12 +148,17 @@ monitor_speed = 115200
 ### 4.1 Startup Sequence
 
 1. Initialize serial port at 115200 baud
-2. Configure GPIO2 as output (LOW initially)
-3. Attach 100ms ticker interrupt for DCF77 output
-4. Initialize pulse array with frame markers
-5. Start WiFiManager for network configuration
-6. Initialize DS1307 I2C slave emulation at address 0x68
-7. Enter main loop upon WiFi connection
+2. Load configuration from EEPROM (or apply defaults)
+3. Configure GPIO2 as output (LOW initially)
+4. Attach 100ms ticker interrupt for DCF77 output
+5. Initialize pulse array with frame markers
+6. Start WiFiManager for network configuration
+7. Configure timezone using POSIX TZ string from config
+8. Start web server for configuration
+9. Initialize DS1307 I2C slave emulation at address 0x68
+10. Perform initial NTP sync
+11. Start first DCF77 transmission immediately (if NTP sync succeeded)
+12. Enter main loop (subsequent DCF transmissions every 5 minutes)
 
 ### 4.2 WiFi Configuration
 
@@ -155,30 +170,40 @@ On first boot or when no stored credentials exist:
 4. Credentials are stored in flash memory
 5. Device reboots and connects as WiFi client
 
-### 4.3 Time Synchronization Cycle
+### 4.3 NTP Synchronization Cycle
 
-Every 60 seconds (approximately):
+NTP sync runs independently at the configured interval (default 7201 seconds):
 
-1. Resolve NTP server hostname (`0.de.pool.ntp.org`)
+1. Resolve NTP server hostname (from config)
 2. Send NTP request packet to port 123
 3. Wait 1 second for response
 4. Parse 48-byte NTP response
 5. Convert NTP timestamp to Unix time
-6. Apply timezone offset (CET = UTC+1)
-7. Calculate daylight saving time status
-8. Apply DST offset if applicable (+1 hour)
-9. Add 2-minute offset for DCF77 protocol
-10. Generate 3-minute pulse array
-11. Wait until second 58 of current minute
-12. Begin transmission
+6. Apply timezone and DST via POSIX TZ string (automatic)
+7. Log synced time
+8. Update DS1307 emulation registers
 
-### 4.4 Error Handling
+### 4.4 DCF77 Transmission Cycle
+
+DCF transmission runs independently every 5 minutes (`DCF_TRANSMIT_INTERVAL = 300s`):
+
+1. Read current time from system clock (`time(nullptr)`)
+2. Validate system clock is set (year > 2020)
+3. If near minute boundary (>56s), wait for next minute
+4. Add 2-minute offset for DCF77 protocol
+5. Generate 3-minute pulse array
+6. Wait until second 58 of current minute
+7. Begin 3-minute transmission
+8. Wait for transmission to complete (~150 seconds)
+
+### 4.5 Error Handling
 
 | Condition | Action |
 |-----------|--------|
-| No NTP response | Retry next minute, reconnect WiFi after 3 failures |
+| No NTP response | Retry at next NTP interval, reconnect WiFi after 3 failures |
 | WiFi disconnected | Attempt reconnection, restart ESP after 10s timeout |
-| Late in minute (>56s) | Skip transmission, retry in 30 seconds |
+| System clock not set | Skip DCF transmission, retry at next DCF interval |
+| Near minute boundary (>56s) | Wait for next minute, then proceed with transmission |
 
 ---
 
@@ -280,29 +305,18 @@ Pulse Array Layout (183 pulses total):
 
 ## 6. Daylight Saving Time
 
-### 6.1 Rules (Central European Time)
+### 6.1 POSIX TZ String Handling
+
+DST transitions are handled automatically by the ESP8266's `configTime()` function using the configured POSIX TZ string. The `localtime_r()` function returns the correct DST state via `tm_isdst`, which is used to set the DCF77 CEST/CET bits.
+
+### 6.2 Rules (Central European Time - default)
 
 | Transition | Date | Time | Action |
 |------------|------|------|--------|
 | Winter to Summer | Last Sunday of March | 02:00 CET | +1 hour (to CEST) |
 | Summer to Winter | Last Sunday of October | 03:00 CEST | -1 hour (to CET) |
 
-### 6.2 Algorithm
-
-```
-if (month >= 4 AND month <= 9):
-    DST = summer time
-else if (month == 3 AND day >= 25):
-    if (days until next Sunday >= days until month end):
-        DST = summer time
-else if (month == 10):
-    DST = summer time (default)
-    if (day >= 25):
-        if (days until next Sunday >= days until month end):
-            DST = winter time
-else:
-    DST = winter time
-```
+The POSIX TZ string `CET-1CEST,M3.5.0,M10.5.0/3` encodes these rules. Other timezones with different DST rules are supported by changing the TZ string via the web interface (see section 10.4).
 
 ---
 
@@ -314,32 +328,43 @@ else:
 |-----------|---------|-------------|
 | `LedPin` | 2 (GPIO2) | DCF77 output pin |
 | `localPort` | 2390 | UDP port for NTP |
-| `ntpServerName` | "0.de.pool.ntp.org" | NTP server pool |
-| `timeZone` | 1 | UTC offset (hours) |
-| `pause` | 0 | Signal level during pause |
-| `sig` | 1 | Signal level during active |
+| `DCF_TRANSMIT_INTERVAL` | 300 (5 min) | DCF77 transmission interval in seconds |
 
 ### 7.2 Runtime Parameters
 
 | Parameter | Value | Description |
 |-----------|-------|-------------|
-| Main loop interval | 60,000 ms | Time between NTP queries |
+| NTP sync interval | Configurable (600-14400s, default 7201s) | Time between NTP queries |
+| DCF transmit interval | 300s (5 minutes) | Time between DCF77 transmissions |
 | NTP timeout | 1,000 ms | Wait for NTP response |
 | WiFi connect timeout | 10,000 ms | Max wait for connection |
 | Max NTP failures | 3 | Before WiFi reconnect |
-| Late second threshold | 56 | Skip if past this second |
+| Late second threshold | 56 | Wait for next minute if past this second |
 
 ---
 
 ## 8. Timing Diagram
 
 ```
-Main Loop Timing (successful transmission):
+Independent Timer Architecture:
 
-0s     1s                    58s        60s       120s      180s      210s
-|------|---------------------|----------|----------|----------|---------|
-  NTP     Calculate arrays      Wait     Minute 1   Minute 2   Minute 3  Safety
- query    for 3 minutes                  transmit   transmit   transmit   wait
+NTP Timer (default 7201s interval):
+0s     1s
+|------|---------> next sync in ~7201s
+  NTP
+ query
+ + DS1307
+  sync
+
+DCF Timer (300s interval):
+0s         ~2s                   58s        60s       120s      180s
+|----------|---------------------|----------|----------|----------|
+ Read clock  Calculate arrays      Wait     Minute 1   Minute 2   Minute 3
+ + validate  for 3 minutes                  transmit   transmit   transmit
+
+Note: NTP and DCF timers run independently. DCF reads the system clock
+directly (kept accurate by ESP8266's internal SNTP) and does not depend
+on the NTP timer having run recently.
 ```
 
 ---
@@ -408,7 +433,7 @@ This ensures sub-second accuracy for time queries.
 - Write operations to time registers are accepted but ignored (time comes from NTP)
 - RAM registers (0x08-0x3F) are functional for read/write
 - Only 24-hour mode is supported
-- Date rollover between NTP syncs is not handled (acceptable for 60-second sync interval)
+- Date rollover between NTP syncs is not handled (acceptable given typical sync intervals)
 
 ---
 
@@ -431,7 +456,8 @@ The firmware includes a built-in web server that provides runtime configuration 
 |---------|-------------|---------|-------|
 | NTP Server | NTP pool hostname | `0.de.pool.ntp.org` | Any valid hostname |
 | Timezone | POSIX TZ string | `CET-1CEST,M3.5.0,M10.5.0/3` | Valid POSIX TZ |
-| NTP Interval | Sync frequency | 60 seconds | 60-3600 seconds |
+| NTP Interval | Sync frequency | 7201 seconds | 600-14400 seconds |
+| DCF77 Signal Polarity | Output signal mode | Non-inverted | Non-inverted (ELV) / Inverted (Pollin) |
 
 ### 10.4 POSIX Timezone String Format
 
@@ -452,15 +478,18 @@ The timezone is configured using POSIX TZ strings, which automatically handle DS
 
 ### 10.5 Status Display
 
-The web interface displays real-time status information:
+The web interface displays a compact real-time status card:
 
 | Status Item | Description |
 |-------------|-------------|
-| Uptime | Time since device boot |
-| WiFi Signal | RSSI in dBm |
-| Last NTP Sync | Time since last successful sync |
-| Current Time | Local time with timezone |
-| DCF77 Status | Transmitting or Idle |
+| Current Time | Local time with timezone (top left, counts up between syncs) |
+| Next DCF | Countdown to next DCF77 transmission (top right); shows "Now" during transmission, "Due" when overdue, or countdown like "3m 45s" |
+| DCF77 | Transmitting or Idle |
+| Transmitting | Time being transmitted and pulse number (e.g., "14:30 (45)") |
+| NTP Sync | Time since last successful sync |
+| WiFi | Connected SSID and signal strength (RSSI in dBm) |
+
+The footer displays the firmware version, device IP address, and uptime.
 
 ### 10.6 API Endpoints
 
@@ -470,6 +499,21 @@ The web interface displays real-time status information:
 | `/status` | GET | JSON status data |
 | `/config` | GET | JSON current configuration |
 | `/config` | POST | Save new configuration |
+| `/ntp-refresh` | POST | Trigger immediate NTP sync |
+
+#### `/status` Response Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `uptime` | int | Seconds since boot |
+| `ssid` | string | Connected WiFi network name |
+| `rssi` | int | WiFi signal strength in dBm |
+| `lastSyncAgo` | int | Seconds since last NTP sync (-1 if never) |
+| `currentTime` | string | Local time with timezone (e.g., "14:30:56 CET") |
+| `dcfTime` | string | Time being transmitted and pulse count (e.g., "14:30 (45)") |
+| `dcfActive` | bool | True if DCF77 transmission is in progress |
+| `nextDcfIn` | int | Seconds until next DCF transmission (-1 if transmitting, 0 if due) |
+| `ip` | string | Device IP address |
 
 ### 10.7 Configuration Storage
 
@@ -484,29 +528,37 @@ The web interface displays real-time status information:
 Baud rate: 115200
 
 ```
-INIT DCF77 emulator V 1.7
+INIT DCF77 emulator V 1.8
 
 Config: Loaded from EEPROM
   NTP Server: 0.de.pool.ntp.org
   Timezone: CET-1CEST,M3.5.0,M10.5.0/3
-  Sync Interval: 60s
+  Sync Interval: 7201s
+  DCF Signal: Non-inverted
 
-Starting WiFi-Manager
-
-WiFi connected
-Timezone configured: CET-1CEST,M3.5.0,M10.5.0/3
+WiFi: Starting WiFiManager
+WiFi: Connected to MyNetwork
 Web server started at http://192.168.1.100
+I2C: DS1307 emulation active at 0x68
 
 Startup complete
-DS1307 I2C emulation active at address 0x68
-Starting UDP
-Local port: 2390
-TimeServerIP: 192.53.103.108
-Sending NTP packet...
-NTP packet received, length=48
-Seconds since 1900 = 3944123456
-Unix time (UTC) = 1735134656
-Local time: 25.12.2024 DST=0 14:30:56
+
+NTP: Querying 0.de.pool.ntp.org (192.53.103.108)
+NTP: Synced - 14:30:56 28.01.2026 CET
+DCF: Preparing transmission at 14:30:56 CET
+DCF: Waiting 22s for minute boundary
+DCF: Starting transmission (14:33 - 14:35)
+DCF: Transmission complete (14:33 - 14:35)
+
+... (5-minute DCF interval, independent NTP interval) ...
+
+DCF: Preparing transmission at 14:35:01 CET
+DCF: Waiting 57s for minute boundary
+DCF: Starting transmission (14:38 - 14:40)
+DCF: Transmission complete (14:38 - 14:40)
+
+NTP: Querying 0.de.pool.ntp.org (192.53.103.108)
+NTP: Synced - 16:31:17 28.01.2026 CET
 ```
 
 ---
@@ -602,6 +654,7 @@ pio test -e native
 | 1.5 | Jan 2025 | Fixed weekday encoding bug, fixed timing calculation bug, removed unused code, added unit tests |
 | 1.6 | Jan 2025 | Added DS1307 I2C slave emulation for external time access |
 | 1.7 | Jan 2025 | Added web configuration interface with POSIX timezone support |
+| 1.8 | Jan 2026 | Decoupled NTP sync and DCF77 transmission into independent timers; DCF transmits every 5 minutes using system clock; NTP syncs at configurable interval; immediate DCF transmission after startup NTP sync; compact status card with next-DCF countdown; added pulse count to web status; added NTP refresh button; documented `/status` API response fields; near-minute-boundary waits instead of skipping |
 
 ---
 

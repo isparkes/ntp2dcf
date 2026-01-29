@@ -28,7 +28,8 @@
 // Default values
 #define DEFAULT_NTP_SERVER "0.de.pool.ntp.org"
 #define DEFAULT_TZ_POSIX "CET-1CEST,M3.5.0,M10.5.0/3"
-#define DEFAULT_NTP_INTERVAL 60    // seconds
+#define DEFAULT_NTP_INTERVAL 7201  // seconds (not a multiple of 60 to spread NTP server load)
+#define DEFAULT_DCF_INVERTED false // false = non-inverted (ELV), true = inverted (Pollin)
 
 // =============================================================================
 // Configuration Structure
@@ -50,7 +51,8 @@ struct NTP2DCFConfig {
     uint8_t version;                    // Config version
     char ntpServer[NTP_SERVER_MAX_LEN]; // NTP pool server hostname
     char tzPosix[TZ_POSIX_MAX_LEN];     // POSIX timezone string
-    uint16_t ntpInterval;               // NTP sync interval in seconds (60-3600)
+    uint16_t ntpInterval;               // NTP sync interval in seconds (600-14400)
+    uint8_t dcfSignalInverted;          // 0 = non-inverted (ELV), 1 = inverted (Pollin)
     uint8_t checksum;                   // Simple checksum for validation
 };
 
@@ -95,6 +97,7 @@ inline void setDefaultConfig() {
     strncpy(config.tzPosix, DEFAULT_TZ_POSIX, TZ_POSIX_MAX_LEN - 1);
     config.tzPosix[TZ_POSIX_MAX_LEN - 1] = '\0';
     config.ntpInterval = DEFAULT_NTP_INTERVAL;
+    config.dcfSignalInverted = DEFAULT_DCF_INVERTED ? 1 : 0;
     config.checksum = calculateChecksum(&config);
 }
 
@@ -126,7 +129,7 @@ inline bool loadConfig() {
     }
 
     // Validate ntpInterval range
-    if (config.ntpInterval < 60 || config.ntpInterval > 3600) {
+    if (config.ntpInterval < 600 || config.ntpInterval > 14400) {
         Serial.println("Config: Invalid NTP interval, correcting");
         config.ntpInterval = DEFAULT_NTP_INTERVAL;
         config.checksum = calculateChecksum(&config);
@@ -145,6 +148,8 @@ inline bool loadConfig() {
     Serial.print("  Sync Interval: ");
     Serial.print(config.ntpInterval);
     Serial.println("s");
+    Serial.print("  DCF Signal: ");
+    Serial.println(config.dcfSignalInverted ? "Inverted" : "Non-inverted");
 
     return true;
 }

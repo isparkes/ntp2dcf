@@ -54,7 +54,7 @@ void test_default_timezone(void) {
 }
 
 void test_default_ntp_interval(void) {
-    TEST_ASSERT_EQUAL(60, DEFAULT_NTP_INTERVAL);
+    TEST_ASSERT_EQUAL(7201, DEFAULT_NTP_INTERVAL);
 }
 
 // =============================================================================
@@ -76,13 +76,13 @@ void test_ntp_server_length(void) {
 // =============================================================================
 
 void test_min_ntp_interval(void) {
-    // Minimum interval should be 60 seconds (1 minute)
-    TEST_ASSERT_GREATER_OR_EQUAL(60, DEFAULT_NTP_INTERVAL);
+    // Minimum interval should be 600 seconds (10 minutes)
+    TEST_ASSERT_GREATER_OR_EQUAL(600, DEFAULT_NTP_INTERVAL);
 }
 
 void test_max_ntp_interval_reasonable(void) {
-    // Maximum should not exceed 3600 seconds (1 hour)
-    TEST_ASSERT_LESS_OR_EQUAL(3600, DEFAULT_NTP_INTERVAL);
+    // Maximum should not exceed 14400 seconds (4 hours)
+    TEST_ASSERT_LESS_OR_EQUAL(14400, DEFAULT_NTP_INTERVAL);
 }
 
 // =============================================================================

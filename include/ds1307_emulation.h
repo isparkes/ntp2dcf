@@ -26,6 +26,7 @@
 #else
 #include <Arduino.h>
 #include <Wire.h>
+#include <time.h>
 #endif
 
 // I2C address (same as real DS1307)
@@ -193,25 +194,19 @@ inline void DS1307_syncFromNTP(int hour, int minute, int second,
 }
 
 inline void DS1307_updateLiveTime() {
-    // Calculate elapsed time since last NTP sync
-    uint32_t elapsedMs = millis() - ds1307.lastSyncMillis;
-    uint32_t elapsedSeconds = elapsedMs / 1000;
+    // Get current time from system clock (keeps running between NTP syncs)
+    time_t now = time(nullptr);
+    struct tm timeinfo;
+    localtime_r(&now, &timeinfo);
 
-    // Calculate current time
-    uint32_t totalSeconds = ds1307.baseSeconds + elapsedSeconds;
-    uint8_t seconds = totalSeconds % 60;
-
-    uint32_t totalMinutes = ds1307.baseMinutes + (totalSeconds / 60);
-    uint8_t minutes = totalMinutes % 60;
-
-    uint32_t totalHours = ds1307.baseHours + (totalMinutes / 60);
-    uint8_t hours = totalHours % 24;
-
-    // Update only time registers (date stays from last sync)
-    // This is acceptable since NTP syncs every 60 seconds
-    ds1307.registers[DS1307_REG_SECONDS] = DS1307_toBCD(seconds) & 0x7F;
-    ds1307.registers[DS1307_REG_MINUTES] = DS1307_toBCD(minutes);
-    ds1307.registers[DS1307_REG_HOURS] = DS1307_toBCD(hours) & 0x3F;
+    // Update all time/date registers with current values
+    ds1307.registers[DS1307_REG_SECONDS] = DS1307_toBCD(timeinfo.tm_sec) & 0x7F;
+    ds1307.registers[DS1307_REG_MINUTES] = DS1307_toBCD(timeinfo.tm_min);
+    ds1307.registers[DS1307_REG_HOURS] = DS1307_toBCD(timeinfo.tm_hour) & 0x3F;
+    ds1307.registers[DS1307_REG_DAY] = timeinfo.tm_wday + 1;  // tm_wday: 0=Sun, DS1307: 1=Sun
+    ds1307.registers[DS1307_REG_DATE] = DS1307_toBCD(timeinfo.tm_mday);
+    ds1307.registers[DS1307_REG_MONTH] = DS1307_toBCD(timeinfo.tm_mon + 1);
+    ds1307.registers[DS1307_REG_YEAR] = DS1307_toBCD(timeinfo.tm_year % 100);
 }
 
 inline void DS1307_onReceive(int numBytes) {

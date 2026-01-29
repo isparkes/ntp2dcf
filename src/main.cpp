@@ -63,6 +63,7 @@
  *
  * VERSION HISTORY:
  * ----------------
+ * V1.8 - Decoupled NTP sync and DCF77 transmission into independent timers
  * V1.7 - Added web-based configuration interface
  * V1.6 - Added DS1307 I2C slave emulation
  * V1.5 - Fixed weekday conversion and timing bugs
@@ -101,36 +102,33 @@
 // =============================================================================
 
 void DcfOut(void);
-void ReadAndDecodeTime(void);
+bool syncNTP(void);               // Fetch time from NTP server, returns true on success
+bool startDcfTransmission(void);  // Start DCF77 transmission from system clock, returns true on success
 int Bin2Bcd(int);
 int WeekdayToDcf77(int);
 void CalculateArray(int);
 void sendNTPpacket(IPAddress &);
 void ReConnectToWiFi(void);
 bool testWifi(void);
+void delayWithWebServer(unsigned long ms);
 
 // =============================================================================
 // CONFIGURATION CONSTANTS
 // =============================================================================
 
-const char *FIRMWARE_VERSION = "V 1.7 - Web configuration interface";
+const char *FIRMWARE_VERSION = "V 1.8 - Independent NTP/DCF timers";
 
 /**
  * DCF77 Signal Polarity Configuration
  * ------------------------------------
  * Different DCF77 receiver modules have different output polarities.
- * Uncomment the appropriate pair for your hardware:
+ * This is now configurable via the web interface:
  *
- * For INVERTED modules (e.g., Pollin):
- *   #define pause 1
- *   #define sig 0
+ * For NON-INVERTED modules (e.g., ELV): pause=0, sig=1
+ * For INVERTED modules (e.g., Pollin): pause=1, sig=0
  *
- * For NON-INVERTED modules (e.g., ELV):
- *   #define pause 0
- *   #define sig 1
+ * The signal levels are computed dynamically based on config.dcfSignalInverted
  */
-#define pause 0  // Signal level during pause (no carrier reduction)
-#define sig 1    // Signal level during pulse (carrier reduction)
 
 // =============================================================================
 // NTP CONFIGURATION
@@ -149,6 +147,9 @@ int UdpNoReplyCounter = 0;                         // Counter for failed NTP req
 
 unsigned long lastNtpSyncMillis = 0;               // Timestamp of last successful NTP sync
 unsigned long lastNtpCheckMillis = 0;              // Timestamp of last NTP check attempt
+unsigned long lastDcfTransmitMillis = 0;           // Timestamp of last DCF transmission attempt
+
+#define DCF_TRANSMIT_INTERVAL 300                  // DCF77 transmission interval in seconds (5 minutes)
 
 // =============================================================================
 // DCF77 PROTOCOL CONSTANTS
@@ -194,6 +195,12 @@ int ThisHour, ThisMinute, ThisSecond;
 int ThisDay, ThisMonth, ThisYear;
 int DayOfW;                        // Day of week (Time library format: Sun=1)
 int Dls;                           // Daylight Saving flag: 0=CET, 1=CEST
+
+// DCF77 transmission time tracking (the time being transmitted, which is in the future)
+int DcfTransmitHour = 0;           // Hour currently being transmitted
+int DcfTransmitMinute = 0;         // Minute currently being transmitted
+time_t DcfFirstMinuteTime = 0;     // Unix time of first minute in transmission
+time_t DcfLastMinuteTime = 0;      // Unix time of last minute in transmission (for logging)
 
 // =============================================================================
 // SETUP - Initialization
@@ -244,31 +251,35 @@ void setup()
 
   // Initialize WiFi using WiFiManager
   // If no saved credentials, creates AP "Ntp2DCF" for configuration
-  Serial.println();
-  Serial.println("Starting WiFi-Manager");
-  Serial.println();
+  Serial.println("WiFi: Starting WiFiManager");
   WiFiManager wifiManager;
   wifiManager.autoConnect("Ntp2DCF");
-
-  Serial.println("WiFi connected");
+  Serial.print("WiFi: Connected to ");
+  Serial.println(WiFi.SSID());
   delay(10);
   pinMode(LED_BUILTIN, OUTPUT);
 
   // Configure timezone using POSIX TZ string
   // This enables automatic DST handling
   configTime(config.tzPosix, config.ntpServer);
-  Serial.print("Timezone configured: ");
-  Serial.println(config.tzPosix);
 
   // Start the web server for configuration
   setupWebServer();
 
-  Serial.println();
-  Serial.println("Startup complete");
-
   // Initialize DS1307 I2C emulation
   DS1307_init();
-  Serial.println("DS1307 I2C emulation active at address 0x68");
+  Serial.println("I2C: DS1307 emulation active at 0x68");
+
+  Serial.println("Startup complete");
+  Serial.println();
+
+  // Perform initial NTP sync and start first DCF transmission immediately
+  if (syncNTP()) {
+    lastNtpCheckMillis = millis();
+    if (startDcfTransmission()) {
+      lastDcfTransmitMillis = millis();
+    }
+  }
 }
 
 // =============================================================================
@@ -294,12 +305,22 @@ void loop()
 
   if (WiFi.status() == WL_CONNECTED)
   {
-    // Check if it's time for an NTP sync
     unsigned long now = millis();
+
+    // --- NTP sync timer (runs at config.ntpInterval) ---
     if (now - lastNtpCheckMillis >= (unsigned long)config.ntpInterval * 1000)
     {
-      lastNtpCheckMillis = now;
-      ReadAndDecodeTime();
+      if (syncNTP()) {
+        lastNtpCheckMillis = now;
+      }
+    }
+
+    // --- DCF transmission timer (runs every DCF_TRANSMIT_INTERVAL) ---
+    if (!DCFOutputOn && (now - lastDcfTransmitMillis >= (unsigned long)DCF_TRANSMIT_INTERVAL * 1000))
+    {
+      if (startDcfTransmission()) {
+        lastDcfTransmitMillis = millis();  // Use millis() after transmission completes
+      }
     }
   }
   else
@@ -372,207 +393,303 @@ void ReConnectToWiFi()
   }
 }
 
+/**
+ * delayWithWebServer()
+ * --------------------
+ * Performs a delay while continuing to handle web server requests.
+ *
+ * This prevents HTTP request timeouts during long-running operations
+ * like waiting for NTP responses or DCF77 transmission completion.
+ *
+ * Parameters:
+ *   ms - Delay duration in milliseconds
+ */
+void delayWithWebServer(unsigned long ms)
+{
+  unsigned long start = millis();
+  while (millis() - start < ms)
+  {
+    webServer.handleClient();
+    delay(10);  // Small delay to prevent tight loop
+  }
+}
+
 // =============================================================================
 // NTP TIME FETCHING AND PROCESSING
 // =============================================================================
 
 /**
- * ReadAndDecodeTime()
- * -------------------
- * Core function that:
- * 1. Fetches current time from NTP server
- * 2. Calculates daylight saving time status
- * 3. Generates DCF77 pulse arrays for 3 minutes
- * 4. Initiates DCF77 transmission at the correct moment
+ * syncNTP()
+ * ---------
+ * Fetches current time from NTP server and updates the system clock.
+ * This is independent of DCF77 transmission.
  *
- * Timing Strategy:
- * - DCF77 transmits time for the NEXT minute (not current)
- * - We prepare 3 consecutive minutes of data
- * - Transmission starts at second 58 of current minute
- * - This ensures the first complete minute starts at :00
+ * Returns:
+ *   true  - NTP sync successful
+ *   false - NTP sync failed
  */
-void ReadAndDecodeTime()
+bool syncNTP()
 {
   // Resolve NTP server hostname to IP address (from config)
   WiFi.hostByName(config.ntpServer, timeServerIP);
 
-  Serial.println("Starting UDP");
-  udp.begin(localPort);
-  Serial.print("Local port: ");
-  Serial.println(udp.localPort());
-  Serial.print("TimeServerIP: ");
-  Serial.println(timeServerIP);
-  Serial.print("Uptime (s): ");
-  Serial.println(millis() / 1000);
+  Serial.print("NTP: Querying ");
+  Serial.print(config.ntpServer);
+  Serial.print(" (");
+  Serial.print(timeServerIP);
+  Serial.println(")");
 
-  // Send NTP request and wait for response
+  udp.begin(localPort);
   sendNTPpacket(timeServerIP);
-  delay(1000);  // Wait for NTP reply
+  delayWithWebServer(1000);  // Wait for NTP reply
 
   int packetSize = udp.parsePacket();
   if (!packetSize)
   {
     // No NTP response received
-    Serial.println("No NTP packet received");
+    Serial.println("NTP: No response received");
 
     // After 3 consecutive failures, force WiFi reconnection
     if (UdpNoReplyCounter++ == 3)
     {
-      Serial.println("!!! Too many UDP errors, reconnecting WiFi");
+      Serial.println("NTP: Too many failures, reconnecting WiFi");
       ReConnectToWiFi();
       UdpNoReplyCounter = 0;
     }
+    udp.stop();
+    return false;
   }
-  else
-  {
-    // =========================================================================
-    // NTP PACKET PARSING
-    // =========================================================================
 
-    UdpNoReplyCounter = 0;
-    lastNtpSyncMillis = millis();  // Record successful sync time
-    Serial.print("NTP packet received, length=");
-    Serial.println(packetSize);
+  // =========================================================================
+  // NTP PACKET PARSING
+  // =========================================================================
 
-    // Read NTP packet into buffer
-    udp.read(packetBuffer, NTP_PACKET_SIZE);
+  UdpNoReplyCounter = 0;
+  lastNtpSyncMillis = millis();  // Record successful sync time
 
-    // Extract 32-bit NTP timestamp from bytes 40-43
-    // NTP timestamp = seconds since January 1, 1900
-    unsigned long highWord = word(packetBuffer[40], packetBuffer[41]);
-    unsigned long lowWord = word(packetBuffer[42], packetBuffer[43]);
-    unsigned long secsSince1900 = highWord << 16 | lowWord;
-    Serial.print("Seconds since 1900 = ");
-    Serial.println(secsSince1900);
+  // Read NTP packet into buffer
+  udp.read(packetBuffer, NTP_PACKET_SIZE);
 
-    // Convert NTP timestamp to Unix timestamp (UTC)
-    // Unix epoch starts January 1, 1970 (70 years after NTP epoch)
-    const unsigned long seventyYears = 2208988800UL;
-    time_t utcTime = secsSince1900 - seventyYears;
+  // Extract 32-bit NTP timestamp from bytes 40-43
+  // NTP timestamp = seconds since January 1, 1900
+  unsigned long highWord = word(packetBuffer[40], packetBuffer[41]);
+  unsigned long lowWord = word(packetBuffer[42], packetBuffer[43]);
+  unsigned long secsSince1900 = highWord << 16 | lowWord;
 
-    // Add 120 seconds (2 minutes) because:
-    //   - DCF77 transmits time for the NEXT minute (+60s)
-    //   - Our transmission starts at the NEXT minute boundary (+60s more)
-    utcTime += 120;
+  // Convert NTP timestamp to Unix timestamp (UTC)
+  // Unix epoch starts January 1, 1970 (70 years after NTP epoch)
+  const unsigned long seventyYears = 2208988800UL;
+  time_t utcTime = secsSince1900 - seventyYears;
 
-    Serial.print("Unix time (UTC) = ");
-    Serial.println(utcTime);
+  // =========================================================================
+  // TIMEZONE AND DST CONVERSION (using POSIX TZ string)
+  // =========================================================================
 
-    // =========================================================================
-    // TIMEZONE AND DST CONVERSION (using POSIX TZ string)
-    // =========================================================================
-    // The configTime() function was called with the POSIX TZ string,
-    // so localtime_r() will automatically apply timezone and DST rules.
+  struct tm timeinfo;
+  localtime_r(&utcTime, &timeinfo);
 
-    struct tm timeinfo;
-    localtime_r(&utcTime, &timeinfo);
+  // Extract current time components for display and DS1307
+  ThisSecond = timeinfo.tm_sec;
+  ThisMinute = timeinfo.tm_min;
+  ThisHour = timeinfo.tm_hour;
+  ThisDay = timeinfo.tm_mday;
+  ThisMonth = timeinfo.tm_mon + 1;
+  ThisYear = timeinfo.tm_year + 1900;
+  DayOfW = timeinfo.tm_wday + 1;
+  if (DayOfW == 0) DayOfW = 7;
 
-    // Extract time components
-    ThisSecond = timeinfo.tm_sec;
-    ThisMinute = timeinfo.tm_min;
-    ThisHour = timeinfo.tm_hour;
-    ThisDay = timeinfo.tm_mday;
-    ThisMonth = timeinfo.tm_mon + 1;  // tm_mon is 0-11
-    ThisYear = timeinfo.tm_year + 1900;  // tm_year is years since 1900
-    DayOfW = timeinfo.tm_wday + 1;  // tm_wday is 0-6 (Sun=0), we need 1-7 (Sun=1)
-    if (DayOfW == 0) DayOfW = 7;  // Handle edge case
+  // DST flag from the system (automatically calculated from POSIX TZ string)
+  Dls = timeinfo.tm_isdst > 0 ? 1 : 0;
 
-    // DST flag from the system (automatically calculated from POSIX TZ string)
-    Dls = timeinfo.tm_isdst > 0 ? 1 : 0;
+  // Format and print local time
+  char timeStr[32];
+  snprintf(timeStr, sizeof(timeStr), "%02d:%02d:%02d %02d.%02d.%04d %s",
+           ThisHour, ThisMinute, ThisSecond,
+           ThisDay, ThisMonth, ThisYear,
+           Dls ? "CEST" : "CET");
+  Serial.print("NTP: Synced - ");
+  Serial.println(timeStr);
 
-    Serial.print("Local time: ");
-    Serial.print(ThisDay);
-    Serial.print(".");
-    Serial.print(ThisMonth);
-    Serial.print(".");
-    Serial.print(ThisYear);
-    Serial.print(" ");
-    Serial.print("DST=");
-    Serial.print(Dls);
-    Serial.print(" ");
-
-    Serial.print(ThisHour);
-    Serial.print(':');
-    Serial.print(ThisMinute);
-    Serial.print(':');
-    Serial.println(ThisSecond);
-
-    // Sync DS1307 registers with NTP time
-    DS1307_syncFromNTP(ThisHour, ThisMinute, ThisSecond,
-                       DayOfW, ThisDay, ThisMonth, ThisYear);
-
-    // If we're too close to minute boundary, skip this cycle
-    // (not enough time to calculate and start transmission)
-    if (ThisSecond > 56)
-    {
-      Serial.println("Too late in minute, skipping to next cycle");
-      delay(30000);
-      return;
-    }
-
-    // =========================================================================
-    // DCF77 PULSE ARRAY GENERATION
-    // =========================================================================
-    // Generate pulse sequences for 3 consecutive minutes.
-    // Save the original second before calculations modify time variables.
-
-    int OriginalSecond = ThisSecond;
-
-    // First minute (the minute we're about to transmit)
-    CalculateArray(FirstMinutePulseBegin);
-
-    // Second minute (+1)
-    utcTime += 60;
-    localtime_r(&utcTime, &timeinfo);
-    ThisSecond = timeinfo.tm_sec;
-    ThisMinute = timeinfo.tm_min;
-    ThisHour = timeinfo.tm_hour;
-    ThisDay = timeinfo.tm_mday;
-    ThisMonth = timeinfo.tm_mon + 1;
-    ThisYear = timeinfo.tm_year + 1900;
-    DayOfW = timeinfo.tm_wday + 1;
-    if (DayOfW == 0) DayOfW = 7;
-    Dls = timeinfo.tm_isdst > 0 ? 1 : 0;
-    CalculateArray(SecondMinutePulseBegin);
-
-    // Third minute (+2)
-    utcTime += 60;
-    localtime_r(&utcTime, &timeinfo);
-    ThisSecond = timeinfo.tm_sec;
-    ThisMinute = timeinfo.tm_min;
-    ThisHour = timeinfo.tm_hour;
-    ThisDay = timeinfo.tm_mday;
-    ThisMonth = timeinfo.tm_mon + 1;
-    ThisYear = timeinfo.tm_year + 1900;
-    DayOfW = timeinfo.tm_wday + 1;
-    if (DayOfW == 0) DayOfW = 7;
-    Dls = timeinfo.tm_isdst > 0 ? 1 : 0;
-    CalculateArray(ThirdMinutePulseBegin);
-
-    // =========================================================================
-    // TRANSMISSION START
-    // =========================================================================
-    // Wait until second 58, then start transmission.
-    // The sync pulse at array[0] plays during second 58,
-    // the blank at array[1] at second 59 (minute marker),
-    // and the actual time data starts at second 0 of the new minute.
-
-    int waitSeconds = 58 - OriginalSecond;
-    Serial.print("Waiting ");
-    Serial.print(waitSeconds);
-    Serial.println(" seconds to start transmission");
-    delay(waitSeconds * 1000);
-
-    // Enable DCF77 output - DcfOut() timer will now generate pulses
-    DCFOutputOn = 1;
-
-    // Wait for 3-minute transmission to complete (180s)
-    // Plus 30s buffer to ensure we're mid-minute for next cycle
-    // Total: 150s here + 60s in main loop = 210s = 3.5 minutes
-    delay(150000);
-  }
+  // Sync DS1307 registers with actual NTP time
+  DS1307_syncFromNTP(ThisHour, ThisMinute, ThisSecond,
+                     DayOfW, ThisDay, ThisMonth, ThisYear);
 
   udp.stop();
+  return true;
+}
+
+/**
+ * startDcfTransmission()
+ * ----------------------
+ * Reads the current system clock and generates a 3-minute DCF77
+ * pulse train. Independent of NTP - uses whatever time the system
+ * clock currently has (kept accurate by ESP8266's internal SNTP).
+ *
+ * Returns:
+ *   true  - Transmission started successfully
+ *   false - Could not start (time not set or too close to minute boundary)
+ */
+bool startDcfTransmission()
+{
+  // Don't start if a transmission is already in progress
+  if (DCFOutputOn) {
+    return false;
+  }
+
+  // Read current time from system clock
+  time_t now = time(nullptr);
+  struct tm timeinfo;
+  localtime_r(&now, &timeinfo);
+
+  // Validate that the system clock is set (year > 2020)
+  if (timeinfo.tm_year + 1900 < 2021) {
+    Serial.println("DCF: System clock not set, skipping transmission");
+    return false;
+  }
+
+  int currentSecond = timeinfo.tm_sec;
+
+  // If we're too close to minute boundary, wait for the next minute
+  if (currentSecond > 56)
+  {
+    int waitForNextMinute = 62 - currentSecond;  // Wait past second 0 of next minute
+    Serial.print("DCF: Near minute boundary, waiting ");
+    Serial.print(waitForNextMinute);
+    Serial.println("s for next minute");
+    delayWithWebServer(waitForNextMinute * 1000);
+
+    // Re-read time after waiting
+    now = time(nullptr);
+    localtime_r(&now, &timeinfo);
+    currentSecond = timeinfo.tm_sec;
+  }
+
+  // Update globals from current time
+  ThisSecond = timeinfo.tm_sec;
+  ThisMinute = timeinfo.tm_min;
+  ThisHour = timeinfo.tm_hour;
+  ThisDay = timeinfo.tm_mday;
+  ThisMonth = timeinfo.tm_mon + 1;
+  ThisYear = timeinfo.tm_year + 1900;
+  DayOfW = timeinfo.tm_wday + 1;
+  if (DayOfW == 0) DayOfW = 7;
+  Dls = timeinfo.tm_isdst > 0 ? 1 : 0;
+
+  // Log what time we're starting from
+  char timeStr[32];
+  snprintf(timeStr, sizeof(timeStr), "%02d:%02d:%02d %s",
+           ThisHour, ThisMinute, ThisSecond,
+           Dls ? "CEST" : "CET");
+  Serial.print("DCF: Preparing transmission at ");
+  Serial.println(timeStr);
+
+  // =========================================================================
+  // DCF77 PULSE ARRAY GENERATION
+  // =========================================================================
+  // Generate pulse sequences for 3 consecutive minutes.
+  // DCF77 transmits time for the NEXT minute, and our transmission starts
+  // at the next minute boundary, so we add 120 seconds (2 minutes) offset.
+
+  time_t dcfTime = now + (120 - currentSecond);  // Round to start of minute + 2 minutes
+  DcfFirstMinuteTime = dcfTime;
+
+  // First minute
+  localtime_r(&dcfTime, &timeinfo);
+  ThisSecond = timeinfo.tm_sec;
+  ThisMinute = timeinfo.tm_min;
+  ThisHour = timeinfo.tm_hour;
+  ThisDay = timeinfo.tm_mday;
+  ThisMonth = timeinfo.tm_mon + 1;
+  ThisYear = timeinfo.tm_year + 1900;
+  DayOfW = timeinfo.tm_wday + 1;
+  if (DayOfW == 0) DayOfW = 7;
+  Dls = timeinfo.tm_isdst > 0 ? 1 : 0;
+  DcfTransmitHour = ThisHour;
+  DcfTransmitMinute = ThisMinute;
+  CalculateArray(FirstMinutePulseBegin);
+
+  // Second minute (+1)
+  dcfTime += 60;
+  localtime_r(&dcfTime, &timeinfo);
+  ThisSecond = timeinfo.tm_sec;
+  ThisMinute = timeinfo.tm_min;
+  ThisHour = timeinfo.tm_hour;
+  ThisDay = timeinfo.tm_mday;
+  ThisMonth = timeinfo.tm_mon + 1;
+  ThisYear = timeinfo.tm_year + 1900;
+  DayOfW = timeinfo.tm_wday + 1;
+  if (DayOfW == 0) DayOfW = 7;
+  Dls = timeinfo.tm_isdst > 0 ? 1 : 0;
+  CalculateArray(SecondMinutePulseBegin);
+
+  // Third minute (+2)
+  dcfTime += 60;
+  DcfLastMinuteTime = dcfTime;
+  localtime_r(&dcfTime, &timeinfo);
+  ThisSecond = timeinfo.tm_sec;
+  ThisMinute = timeinfo.tm_min;
+  ThisHour = timeinfo.tm_hour;
+  ThisDay = timeinfo.tm_mday;
+  ThisMonth = timeinfo.tm_mon + 1;
+  ThisYear = timeinfo.tm_year + 1900;
+  DayOfW = timeinfo.tm_wday + 1;
+  if (DayOfW == 0) DayOfW = 7;
+  Dls = timeinfo.tm_isdst > 0 ? 1 : 0;
+  CalculateArray(ThirdMinutePulseBegin);
+
+  // =========================================================================
+  // TRANSMISSION START
+  // =========================================================================
+  // Wait until second 58, then start transmission.
+
+  // Re-read current second (time may have passed during array calculation)
+  now = time(nullptr);
+  localtime_r(&now, &timeinfo);
+  int waitSeconds = 58 - timeinfo.tm_sec;
+  if (waitSeconds < 0) waitSeconds += 60;  // Wrapped past minute boundary
+
+  Serial.print("DCF: Waiting ");
+  Serial.print(waitSeconds);
+  Serial.println("s for minute boundary");
+  delayWithWebServer(waitSeconds * 1000);
+
+  // Log transmission start
+  {
+    struct tm startInfo, endInfo;
+    localtime_r(&DcfFirstMinuteTime, &startInfo);
+    localtime_r(&DcfLastMinuteTime, &endInfo);
+    char startStr[16], endStr[16];
+    snprintf(startStr, sizeof(startStr), "%02d:%02d", startInfo.tm_hour, startInfo.tm_min);
+    snprintf(endStr, sizeof(endStr), "%02d:%02d", endInfo.tm_hour, endInfo.tm_min);
+    Serial.print("DCF: Starting transmission (");
+    Serial.print(startStr);
+    Serial.print(" - ");
+    Serial.print(endStr);
+    Serial.println(")");
+  }
+
+  // Enable DCF77 output - DcfOut() timer will now generate pulses
+  DCFOutputOn = 1;
+
+  // Wait for 3-minute transmission to complete
+  delayWithWebServer(150000);
+
+  // Log transmission complete
+  {
+    struct tm startInfo, endInfo;
+    localtime_r(&DcfFirstMinuteTime, &startInfo);
+    localtime_r(&DcfLastMinuteTime, &endInfo);
+    char startStr[16], endStr[16];
+    snprintf(startStr, sizeof(startStr), "%02d:%02d", startInfo.tm_hour, startInfo.tm_min);
+    snprintf(endStr, sizeof(endStr), "%02d:%02d", endInfo.tm_hour, endInfo.tm_min);
+    Serial.print("DCF: Transmission complete (");
+    Serial.print(startStr);
+    Serial.print(" - ");
+    Serial.print(endStr);
+    Serial.println(")");
+  }
+
+  return true;
 }
 
 // =============================================================================
@@ -752,8 +869,6 @@ void CalculateArray(int ArrayOffset)
  */
 void sendNTPpacket(IPAddress &address)
 {
-  Serial.println("Sending NTP packet...");
-
   // Clear packet buffer
   memset(packetBuffer, 0, NTP_PACKET_SIZE);
 
@@ -806,12 +921,32 @@ void DcfOut()
 {
   if (DCFOutputOn == 1)
   {
+    // Compute signal levels based on configuration
+    // Non-inverted (ELV): pause=0 (LOW), sig=1 (HIGH)
+    // Inverted (Pollin):  pause=1 (HIGH), sig=0 (LOW)
+    int pause = config.dcfSignalInverted ? 1 : 0;
+    int sig = config.dcfSignalInverted ? 0 : 1;
+
     switch (PartialPulseCount++)
     {
     case 0:
       // Start of second: begin carrier reduction if this is a pulse
       if (PulseArray[PulseCount] != 0)
         digitalWrite(LedPin, pause);  // Reduce carrier (start pulse)
+
+      // Update which minute is being transmitted based on PulseCount
+      // Pulses 2-61: first minute, 62-121: second minute, 122-181: third minute
+      {
+        int minuteOffset = 0;
+        if (PulseCount >= ThirdMinutePulseBegin) minuteOffset = 2;
+        else if (PulseCount >= SecondMinutePulseBegin) minuteOffset = 1;
+
+        time_t currentMinuteTime = DcfFirstMinuteTime + (minuteOffset * 60);
+        struct tm tmInfo;
+        localtime_r(&currentMinuteTime, &tmInfo);
+        DcfTransmitHour = tmInfo.tm_hour;
+        DcfTransmitMinute = tmInfo.tm_min;
+      }
       break;
 
     case 1:
@@ -832,6 +967,7 @@ void DcfOut()
         // Transmission complete - reset for next cycle
         PulseCount = 0;
         DCFOutputOn = 0;
+        digitalWrite(LedPin, pause);
       }
       PartialPulseCount = 0;
       break;

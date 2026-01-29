@@ -20,10 +20,15 @@
 
 // These are defined in main.cpp and shared here
 extern unsigned long lastNtpSyncMillis;
-extern int ThisHour, ThisMinute, ThisSecond;
-extern int ThisDay, ThisMonth, ThisYear;
+extern unsigned long lastNtpCheckMillis;
+extern unsigned long lastDcfTransmitMillis;
 extern int Dls;
 extern int DCFOutputOn;
+extern int PulseCount;         // Current position in pulse array (0-182)
+extern int DcfTransmitMinute;  // The minute currently being transmitted (0-59)
+extern int DcfTransmitHour;    // The hour currently being transmitted (0-23)
+extern bool syncNTP();               // Fetch time from NTP server
+extern bool startDcfTransmission();  // Start DCF77 transmission from system clock
 
 // =============================================================================
 // Web Server Instance
@@ -181,26 +186,37 @@ const char HTML_PAGE[] PROGMEM = R"rawliteral(
         <div class="card">
             <h2>Status</h2>
             <div class="status-grid">
-                <div class="status-item">
-                    <div class="label">Uptime</div>
-                    <div class="value" id="uptime">--</div>
+                <div class="status-item full-width">
+                    <div style="display: flex; justify-content: space-between; align-items: baseline;">
+                        <div>
+                            <div class="label">Current Time</div>
+                            <div class="value" id="currentTime">--</div>
+                        </div>
+                        <div style="text-align: right;">
+                            <div class="label">Next DCF</div>
+                            <div class="value" id="nextDcf">--</div>
+                        </div>
+                    </div>
                 </div>
                 <div class="status-item">
-                    <div class="label">WiFi Signal</div>
-                    <div class="value" id="rssi">--</div>
+                    <div class="label">DCF77</div>
+                    <div class="value" id="dcfStatus">--</div>
                 </div>
                 <div class="status-item">
-                    <div class="label">Last NTP Sync</div>
+                    <div class="label">Transmitting</div>
+                    <div class="value" id="dcfTime">--</div>
+                </div>
+                <div class="status-item">
+                    <div class="label">NTP Sync</div>
                     <div class="value" id="lastSync">--</div>
                 </div>
                 <div class="status-item">
-                    <div class="label">DCF77 Status</div>
-                    <div class="value" id="dcfStatus">--</div>
+                    <div class="label">WiFi</div>
+                    <div class="value"><span id="ssid">--</span> <span id="rssi" style="font-size:0.8em;color:#888;">--</span></div>
                 </div>
-                <div class="status-item full-width">
-                    <div class="label">Current Time</div>
-                    <div class="value" id="currentTime">--</div>
-                </div>
+            </div>
+            <div style="display: flex; gap: 10px; margin-top: 15px;">
+                <button type="button" id="ntpRefreshBtn" style="flex:1;">Refresh NTP Now</button>
             </div>
         </div>
 
@@ -224,8 +240,16 @@ const char HTML_PAGE[] PROGMEM = R"rawliteral(
                 </div>
                 <div class="form-group">
                     <label for="ntpInterval">NTP Sync Interval (seconds)</label>
-                    <input type="number" id="ntpInterval" name="ntpInterval" min="60" max="3600" step="10" placeholder="60">
-                    <div class="hint">Range: 60-3600 seconds (1 minute to 1 hour)</div>
+                    <input type="number" id="ntpInterval" name="ntpInterval" min="600" max="14400" step="1" placeholder="7201">
+                    <div class="hint">Range: 600-14400 seconds (10 minutes to 4 hours)</div>
+                </div>
+                <div class="form-group">
+                    <label for="dcfInverted">DCF77 Signal Polarity</label>
+                    <select id="dcfInverted" name="dcfInverted" style="width: 100%; padding: 12px; border: 1px solid #0f3460; border-radius: 8px; background: #0f3460; color: #fff; font-size: 1em;">
+                        <option value="0">Non-inverted (ELV modules)</option>
+                        <option value="1">Inverted (Pollin modules)</option>
+                    </select>
+                    <div class="hint">Match your DCF77 receiver module type</div>
                 </div>
                 <button type="submit" id="saveBtn">Save Configuration</button>
             </form>
@@ -233,7 +257,7 @@ const char HTML_PAGE[] PROGMEM = R"rawliteral(
 
         <div class="card" style="text-align: center; padding: 15px;">
             <div style="color: #666; font-size: 0.85em;">
-                NTP2DCF v1.7 | <span id="ipAddr">--</span>
+                NTP2DCF v1.8 | <span id="ipAddr">--</span>
             </div>
         </div>
     </div>
@@ -256,23 +280,42 @@ const char HTML_PAGE[] PROGMEM = R"rawliteral(
             return Math.floor(seconds / 3600) + 'h ago';
         }
 
+        function formatNextDcf(seconds) {
+            if (seconds < 0) return 'Now';
+            if (seconds === 0) return 'Due';
+            const m = Math.floor(seconds / 60);
+            const s = seconds % 60;
+            if (m > 0) return m + 'm ' + s + 's';
+            return s + 's';
+        }
+
         async function loadStatus() {
             try {
                 const resp = await fetch('/status');
                 const data = await resp.json();
-                document.getElementById('uptime').textContent = formatUptime(data.uptime);
+                document.getElementById('ssid').textContent = data.ssid;
                 document.getElementById('rssi').textContent = data.rssi + ' dBm';
                 document.getElementById('lastSync').textContent = formatTimeSince(data.lastSyncAgo);
                 document.getElementById('currentTime').textContent = data.currentTime;
-                document.getElementById('ipAddr').textContent = data.ip;
+                document.getElementById('ipAddr').textContent = data.ip + ' | up ' + formatUptime(data.uptime);
 
                 const dcfEl = document.getElementById('dcfStatus');
+                const dcfTimeEl = document.getElementById('dcfTime');
+                const nextDcfEl = document.getElementById('nextDcf');
                 if (data.dcfActive) {
                     dcfEl.textContent = 'Transmitting';
                     dcfEl.className = 'value dcf-active';
+                    dcfTimeEl.textContent = data.dcfTime;
+                    dcfTimeEl.className = 'value dcf-active';
+                    nextDcfEl.textContent = 'Now';
+                    nextDcfEl.className = 'value dcf-active';
                 } else {
                     dcfEl.textContent = 'Idle';
                     dcfEl.className = 'value dcf-idle';
+                    dcfTimeEl.textContent = '--:-- (---)';
+                    dcfTimeEl.className = 'value';
+                    nextDcfEl.textContent = formatNextDcf(data.nextDcfIn);
+                    nextDcfEl.className = 'value';
                 }
             } catch (e) {
                 console.error('Status fetch error:', e);
@@ -286,6 +329,7 @@ const char HTML_PAGE[] PROGMEM = R"rawliteral(
                 document.getElementById('ntpServer').value = data.ntpServer;
                 document.getElementById('tzPosix').value = data.tzPosix;
                 document.getElementById('ntpInterval').value = data.ntpInterval;
+                document.getElementById('dcfInverted').value = data.dcfInverted;
             } catch (e) {
                 console.error('Config fetch error:', e);
             }
@@ -309,6 +353,7 @@ const char HTML_PAGE[] PROGMEM = R"rawliteral(
                 formData.append('ntpServer', document.getElementById('ntpServer').value);
                 formData.append('tzPosix', document.getElementById('tzPosix').value);
                 formData.append('ntpInterval', document.getElementById('ntpInterval').value);
+                formData.append('dcfInverted', document.getElementById('dcfInverted').value);
 
                 const resp = await fetch('/config', {
                     method: 'POST',
@@ -327,6 +372,28 @@ const char HTML_PAGE[] PROGMEM = R"rawliteral(
 
             btn.disabled = false;
             btn.textContent = 'Save Configuration';
+        });
+
+        // NTP Refresh button handler
+        document.getElementById('ntpRefreshBtn').addEventListener('click', async () => {
+            const btn = document.getElementById('ntpRefreshBtn');
+            btn.disabled = true;
+            btn.textContent = 'Refreshing...';
+
+            try {
+                const resp = await fetch('/ntp-refresh', { method: 'POST' });
+                if (resp.ok) {
+                    showMessage('NTP refresh started', false);
+                } else {
+                    showMessage('Failed to start NTP refresh', true);
+                }
+            } catch (e) {
+                showMessage('Error: ' + e.message, true);
+            }
+
+            btn.disabled = false;
+            btn.textContent = 'Refresh NTP Now';
+            loadStatus();
         });
 
         // Initial load
@@ -359,19 +426,48 @@ inline void handleGetStatus() {
     long lastSyncAgo = (lastNtpSyncMillis > 0) ?
         (long)((millis() - lastNtpSyncMillis) / 1000) : -1;
 
+    // Get current time dynamically from system clock (counts up between NTP syncs)
+    time_t now = time(nullptr);
+    struct tm timeinfo;
+    localtime_r(&now, &timeinfo);
+
     // Format current time string
     char timeStr[32];
     snprintf(timeStr, sizeof(timeStr), "%02d:%02d:%02d %s",
-             ThisHour, ThisMinute, ThisSecond,
+             timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec,
              Dls ? "CEST" : "CET");
+
+    // Format DCF transmission time with pulse count (only valid when transmitting)
+    char dcfTimeStr[32] = "--:-- (---)";
+    if (DCFOutputOn) {
+        snprintf(dcfTimeStr, sizeof(dcfTimeStr), "%02d:%02d (%d)",
+                 DcfTransmitHour, DcfTransmitMinute, PulseCount);
+    }
+
+    // Calculate time until next DCF transmission
+    long nextDcfIn = -1;  // -1 means transmitting now
+    if (DCFOutputOn) {
+        nextDcfIn = -1;
+    } else {
+        unsigned long elapsed = millis() - lastDcfTransmitMillis;
+        unsigned long intervalMs = (unsigned long)300 * 1000;  // DCF_TRANSMIT_INTERVAL
+        if (elapsed < intervalMs) {
+            nextDcfIn = (long)((intervalMs - elapsed) / 1000);
+        } else {
+            nextDcfIn = 0;  // Due now
+        }
+    }
 
     // Build JSON response
     String json = "{";
     json += "\"uptime\":" + String(uptimeSeconds) + ",";
+    json += "\"ssid\":\"" + WiFi.SSID() + "\",";
     json += "\"rssi\":" + String(WiFi.RSSI()) + ",";
     json += "\"lastSyncAgo\":" + String(lastSyncAgo) + ",";
     json += "\"currentTime\":\"" + String(timeStr) + "\",";
+    json += "\"dcfTime\":\"" + String(dcfTimeStr) + "\",";
     json += "\"dcfActive\":" + String(DCFOutputOn ? "true" : "false") + ",";
+    json += "\"nextDcfIn\":" + String(nextDcfIn) + ",";
     json += "\"ip\":\"" + WiFi.localIP().toString() + "\"";
     json += "}";
 
@@ -385,7 +481,8 @@ inline void handleGetConfig() {
     String json = "{";
     json += "\"ntpServer\":\"" + String(config.ntpServer) + "\",";
     json += "\"tzPosix\":\"" + String(config.tzPosix) + "\",";
-    json += "\"ntpInterval\":" + String(config.ntpInterval);
+    json += "\"ntpInterval\":" + String(config.ntpInterval) + ",";
+    json += "\"dcfInverted\":" + String(config.dcfSignalInverted);
     json += "}";
 
     webServer.send(200, "application/json", json);
@@ -426,12 +523,22 @@ inline void handlePostConfig() {
 
     if (webServer.hasArg("ntpInterval")) {
         int newInterval = webServer.arg("ntpInterval").toInt();
-        if (newInterval >= 60 && newInterval <= 3600) {
+        if (newInterval >= 600 && newInterval <= 14400) {
             config.ntpInterval = newInterval;
             changed = true;
             Serial.print("Config: NTP interval changed to ");
             Serial.print(config.ntpInterval);
             Serial.println("s");
+        }
+    }
+
+    if (webServer.hasArg("dcfInverted")) {
+        int newInverted = webServer.arg("dcfInverted").toInt();
+        if (newInverted == 0 || newInverted == 1) {
+            config.dcfSignalInverted = newInverted;
+            changed = true;
+            Serial.print("Config: DCF signal polarity changed to ");
+            Serial.println(config.dcfSignalInverted ? "Inverted" : "Non-inverted");
         }
     }
 
@@ -441,6 +548,18 @@ inline void handlePostConfig() {
     } else {
         webServer.send(400, "application/json", "{\"status\":\"error\",\"message\":\"No valid parameters\"}");
     }
+}
+
+/**
+ * Handle POST /ntp-refresh - Trigger an NTP sync
+ */
+inline void handleNtpRefresh() {
+    Serial.println("Web: NTP refresh requested");
+    webServer.send(200, "application/json", "{\"status\":\"ok\"}");
+
+    // Trigger NTP sync and reset the check timer
+    syncNTP();
+    lastNtpCheckMillis = millis();
 }
 
 /**
@@ -463,6 +582,7 @@ inline void setupWebServer() {
     webServer.on("/status", HTTP_GET, handleGetStatus);
     webServer.on("/config", HTTP_GET, handleGetConfig);
     webServer.on("/config", HTTP_POST, handlePostConfig);
+    webServer.on("/ntp-refresh", HTTP_POST, handleNtpRefresh);
     webServer.onNotFound(handleNotFound);
 
     webServer.begin();
