@@ -63,14 +63,15 @@
  *
  * VERSION HISTORY:
  * ----------------
- * V1.8 - Decoupled NTP sync and DCF77 transmission into independent timers
- * V1.7 - Added web-based configuration interface
- * V1.6 - Added DS1307 I2C slave emulation
- * V1.5 - Fixed weekday conversion and timing bugs
- * V1.4 - WiFiManager integration for easy configuration
- * V1.3 - Added WiFi reconnection logic
- * V1.2 - Increased WiFi timeout to 30 seconds
- * V1.1 - Initial NTP integration
+ * V1.8.1 - Fix compiler warnings about buffer size on snprintf
+ * V1.8   - Decoupled NTP sync and DCF77 transmission into independent timers
+ * V1.7   - Added web-based configuration interface
+ * V1.6   - Added DS1307 I2C slave emulation
+ * V1.5   - Fixed weekday conversion and timing bugs
+ * V1.4   - WiFiManager integration for easy configuration
+ * V1.3   - Added WiFi reconnection logic
+ * V1.2   - Increased WiFi timeout to 30 seconds
+ * V1.1   - Initial NTP integration
  *
  * CREDITS:
  * --------
@@ -494,7 +495,7 @@ bool syncNTP()
   ThisHour = timeinfo.tm_hour;
   ThisDay = timeinfo.tm_mday;
   ThisMonth = timeinfo.tm_mon + 1;
-  ThisYear = timeinfo.tm_year + 1900;
+  ThisYear = timeinfo.tm_year + 1900; 
   DayOfW = timeinfo.tm_wday + 1;
   if (DayOfW == 0) DayOfW = 7;
 
@@ -502,7 +503,7 @@ bool syncNTP()
   Dls = timeinfo.tm_isdst > 0 ? 1 : 0;
 
   // Format and print local time
-  char timeStr[32];
+  char timeStr[80];
   snprintf(timeStr, sizeof(timeStr), "%02d:%02d:%02d %02d.%02d.%04d %s",
            ThisHour, ThisMinute, ThisSecond,
            ThisDay, ThisMonth, ThisYear,
