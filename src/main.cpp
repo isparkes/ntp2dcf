@@ -117,7 +117,7 @@ void delayWithWebServer(unsigned long ms);
 // CONFIGURATION CONSTANTS
 // =============================================================================
 
-const char *FIRMWARE_VERSION = "V 1.8 - Independent NTP/DCF timers";
+const char *FIRMWARE_VERSION = "V 1.8.1 - Independent NTP/DCF timers";
 
 /**
  * DCF77 Signal Polarity Configuration
